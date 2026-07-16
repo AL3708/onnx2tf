@@ -18946,6 +18946,151 @@ def _optimize_transpose_pre_dequant_concat_quantize_post_nhwc_chains(
     return {"optimized_transpose_pre_dequant_concat_quantize_post_nhwc_chains": int(optimized)}
 
 
+def _optimize_transpose_concat_nhwc_chains(
+    model_ir: ModelIR,
+) -> Dict[str, int]:
+    """
+    Remove NCHW adapter TRANSPOSEs around INT8 CONCATENATION ops.
+
+    Target:
+      x_i_nhwc --TRANSPOSE(0,3,1,2)--> x_i_nchw
+      CONCATENATION(axis=1, [x_0_nchw, ...]) -> cat_nchw
+      cat_nchw --TRANSPOSE(0,2,3,1)--> cat_nhwc
+
+    Rewrite:
+      CONCATENATION(axis=3, [x_0_nhwc, ...]) -> cat_nhwc
+    """
+    optimized = 0
+    perm_nhwc_to_nchw = [0, 3, 1, 2]
+    perm_nchw_to_nhwc = [0, 2, 3, 1]
+
+    while True:
+        changed = False
+        consumers = _build_tensor_consumer_map(model_ir)
+        producers = _build_tensor_producer_map(model_ir)
+        model_outputs = set(str(v) for v in model_ir.outputs)
+
+        for concat_idx, concat_op in enumerate(model_ir.operators):
+            if str(concat_op.op_type) != "CONCATENATION" or len(concat_op.outputs) != 1:
+                continue
+            concat_axis = int(concat_op.options.get("axis", 1))
+            if concat_axis < 0:
+                concat_axis += 4
+            if concat_axis != 1:
+                continue
+
+            concat_out_name = str(concat_op.outputs[0])
+            if concat_out_name in model_outputs:
+                continue
+
+            concat_users = [int(v) for v in consumers.get(concat_out_name, [])]
+            if len(concat_users) != 1:
+                continue
+            post_idx = int(concat_users[0])
+            post_op = model_ir.operators[post_idx]
+            if (
+                str(post_op.op_type) != "TRANSPOSE"
+                or len(post_op.inputs) < 2
+                or len(post_op.outputs) != 1
+                or str(post_op.inputs[0]) != concat_out_name
+                or _read_transpose_perm(model_ir, post_op) != perm_nchw_to_nhwc
+            ):
+                continue
+            post_out_name = str(post_op.outputs[0])
+            if post_out_name in model_outputs:
+                continue
+
+            pre_indices_to_remove: List[int] = []
+            new_input_names: List[str] = []
+            rewrite_ok = True
+            for concat_input_name in [str(v) for v in concat_op.inputs]:
+                pre_idx = producers.get(str(concat_input_name), None)
+                if pre_idx is None:
+                    rewrite_ok = False
+                    break
+                pre_op = model_ir.operators[int(pre_idx)]
+                if (
+                    str(pre_op.op_type) != "TRANSPOSE"
+                    or len(pre_op.inputs) < 2
+                    or len(pre_op.outputs) != 1
+                    or str(pre_op.outputs[0]) != concat_input_name
+                    or _read_transpose_perm(model_ir, pre_op) != perm_nhwc_to_nchw
+                ):
+                    rewrite_ok = False
+                    break
+                if concat_input_name in model_outputs:
+                    rewrite_ok = False
+                    break
+                pre_users = [int(v) for v in consumers.get(str(concat_input_name), [])]
+                if set(pre_users) != {int(concat_idx)}:
+                    rewrite_ok = False
+                    break
+                new_input_names.append(str(pre_op.inputs[0]))
+                pre_indices_to_remove.append(int(pre_idx))
+
+            if not rewrite_ok:
+                continue
+
+            _set_operator_inputs(
+                model_ir=model_ir,
+                op=concat_op,
+                new_inputs=new_input_names,
+            )
+            concat_op.options["axis"] = 3
+
+            _permute_tensor_metadata_if_rank_matches(
+                model_ir.tensors.get(concat_out_name, None),
+                perm_nchw_to_nhwc,
+            )
+
+            post_tensor = model_ir.tensors.get(post_out_name, None)
+            concat_out_tensor = model_ir.tensors.get(concat_out_name, None)
+            if post_tensor is not None and concat_out_tensor is not None:
+                post_tensor.dtype = str(concat_out_tensor.dtype)
+                post_tensor.quantization = _clone_quantization(concat_out_tensor.quantization)
+                post_tensor.shape = [int(v) for v in list(concat_out_tensor.shape)]
+                post_tensor.shape_signature = (
+                    [int(v) for v in list(concat_out_tensor.shape_signature)]
+                    if concat_out_tensor.shape_signature is not None
+                    else [int(v) for v in list(concat_out_tensor.shape)]
+                )
+
+            # Propagate shared quantization from CONCAT output to new NHWC input tensors.
+            # The x_nchw inputs (TRANSPOSE outputs) had shared quant set by the builder,
+            # but now we use x_nhwc tensors directly — update their quant metadata so
+            # TFLite INT8 CONCATENATION sees identical scale/zp on all inputs and output.
+            if concat_out_tensor is not None and concat_out_tensor.quantization is not None:
+                for nhwc_input_name in new_input_names:
+                    nhwc_tensor = model_ir.tensors.get(nhwc_input_name, None)
+                    if nhwc_tensor is not None:
+                        nhwc_tensor.quantization = _clone_quantization(concat_out_tensor.quantization)
+
+            _set_operator_outputs(
+                model_ir=model_ir,
+                op=concat_op,
+                new_outputs=[post_out_name],
+            )
+
+            remove_indices = sorted(
+                list({*pre_indices_to_remove, post_idx}),
+                reverse=True,
+            )
+            for remove_idx in remove_indices:
+                if int(remove_idx) == int(concat_idx):
+                    continue
+                del model_ir.operators[int(remove_idx)]
+
+            optimized += 1
+            changed = True
+            break
+
+        if not changed:
+            break
+
+    _prune_unused_tensors(model_ir)
+    return {"optimized_transpose_concat_nhwc_chains": int(optimized)}
+
+
 def _optimize_transpose_concat_unary_fanout_conv_nhwc_chains(
     model_ir: ModelIR,
 ) -> Dict[str, int]:
@@ -76881,6 +77026,7 @@ def lower_onnx_to_ir(
     )
     _optimize_transpose_axis3_const_concat_bridge_nhwc_chains(model_ir)
     _optimize_transpose_pre_dequant_concat_quantize_post_nhwc_chains(model_ir)
+    _optimize_transpose_concat_nhwc_chains(model_ir)
     _optimize_transpose_layernorm_stats_nhwc_propagation_chains(model_ir)
     _optimize_layernorm_stats_via_existing_post_transpose_nhwc_chains(model_ir)
     _optimize_layout_transpose_chains(model_ir)
@@ -76963,6 +77109,7 @@ def lower_onnx_to_ir(
         _optimize_transpose_mul_add_const_prepost_nhwc_chains(model_ir)
     _optimize_transpose_dequant_hardsigmoid_quantize_bridges(model_ir)
     _optimize_transpose_pre_dequant_concat_quantize_post_nhwc_chains(model_ir)
+    _optimize_transpose_concat_nhwc_chains(model_ir)
     # Some late specialized rewrites can still leave trivial
     # NHWC->NCHW->NHWC wrappers around unary activations.
     # Run one final strict unary transpose fold before serialization guards.

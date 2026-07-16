@@ -143,6 +143,10 @@ def _promote_internal_uint8_tensor_to_int8(ctx: Any, tensor_name: str) -> None:
         ]
 
 
+def _is_fully_unresolved_shape_signature(signature: List[int]) -> bool:
+    return len(signature) == 0 or all(int(v) < 0 for v in signature)
+
+
 def _propagate_shape(ctx: Any, src_tensor_name: str, dst_tensor_name: str) -> None:
     ctx.ensure_tensor(src_tensor_name)
     ctx.ensure_tensor(dst_tensor_name)
@@ -153,7 +157,15 @@ def _propagate_shape(ctx: Any, src_tensor_name: str, dst_tensor_name: str) -> No
         if src.shape_signature is not None
         else list(src.shape)
     )
-    if dst.shape == [1] and src.shape != [1]:
+    dst_signature = (
+        list(dst.shape_signature)
+        if dst.shape_signature is not None
+        else list(dst.shape)
+    )
+    if (
+        _is_fully_unresolved_shape_signature(dst_signature)
+        and not _is_fully_unresolved_shape_signature(src_signature)
+    ):
         dst.shape = list(src.shape)
         dst.shape_signature = list(src_signature)
     elif len(list(dst.shape)) == len(list(src.shape)) and list(dst.shape) == list(src.shape):
@@ -2307,6 +2319,37 @@ def build_qlinear_global_average_pool_op(node: Any, ctx: Any) -> None:
         _lower_via_dequantize_mean_quantize()
 
 
+def _compute_shared_quant(
+    scales: list[Any],
+    zero_points: list[Any],
+) -> tuple[float, int]:
+    """Compute unified scale/zero_point from multiple (scale, zp) pairs.
+
+    Finds global float min/max across all tensors' representable ranges,
+    then derives a single scale and zero_point for all of them.
+    TFLite INT8 CONCATENATION requires identical quant params on all inputs and output.
+    """
+    INT8_MIN, INT8_MAX = -128, 127
+    f_mins: list[float] = []
+    f_maxs: list[float] = []
+    for s, z in zip(scales, zero_points):
+        s_f = float(np.asarray(s).flat[0])
+        z_i = int(np.asarray(z).flat[0])
+        f_mins.append((INT8_MIN - z_i) * s_f)
+        f_maxs.append((INT8_MAX - z_i) * s_f)
+    g_min = min(f_mins)
+    g_max = max(f_maxs)
+    # Ensure range includes 0 (standard TFLite convention)
+    g_min = min(g_min, 0.0)
+    g_max = max(g_max, 0.0)
+    new_scale = (g_max - g_min) / (INT8_MAX - INT8_MIN)
+    if new_scale == 0.0:
+        new_scale = 1e-8
+    new_zp = int(round(INT8_MIN - g_min / new_scale))
+    new_zp = max(INT8_MIN, min(INT8_MAX, new_zp))
+    return new_scale, new_zp
+
+
 def build_qlinear_concat_op(node: Any, ctx: Any) -> None:
     y_scale_name = node.inputs[0].name
     y_zero_name = node.inputs[1].name
@@ -2341,19 +2384,27 @@ def build_qlinear_concat_op(node: Any, ctx: Any) -> None:
     rank = len(first_shape)
     axis = int(node.attrs.get("axis", 1))
     axis = _normalize_axis(axis, rank)
+    # TFLite INT8 CONCATENATION requires identical quant params on all inputs and output.
+    # Use output (y_scale, y_zero) as the unified shared scale for all tensors.
+    # y_scale is calibrated to cover the full concat range; exact same Python object
+    # ensures no float32 precision drift between inputs.
+    for idx in range(len(input_names)):
+        _require_const(ctx, input_scale_names[idx], f"QLinearConcat input[{idx}] scale")
+        _require_const(ctx, input_zero_names[idx], f"QLinearConcat input[{idx}] zero_point")
+
+    shared_scale_arr = np.asarray(y_scale, dtype=np.float32).reshape(-1)
+    shared_zp_arr = np.asarray(y_zero, dtype=np.int8).reshape(-1)
 
     input_signatures: list[list[int]] = []
     for idx, input_name in enumerate(input_names):
-        input_scale = _require_const(ctx, input_scale_names[idx], f"QLinearConcat input[{idx}] scale")
-        input_zero = _require_const(ctx, input_zero_names[idx], f"QLinearConcat input[{idx}] zero_point")
-        _set_tensor_dtype_from_array(ctx, input_name, input_zero)
+        _set_tensor_dtype_from_array(ctx, input_name, y_zero)
         _promote_internal_uint8_tensor_to_int8(ctx, input_name)
         _set_tensor_quantization(
             ctx=ctx,
             tensor_name=input_name,
-            scale=input_scale,
-            zero_point=input_zero,
-            quantized_dimension=0 if np.asarray(input_scale).size <= 1 else _normalize_axis(1, rank),
+            scale=shared_scale_arr,
+            zero_point=shared_zp_arr,
+            quantized_dimension=0,
         )
         input_tensor = ctx.model_ir.tensors[input_name]
         input_signature = (
@@ -2366,9 +2417,9 @@ def build_qlinear_concat_op(node: Any, ctx: Any) -> None:
     _set_tensor_quantization(
         ctx=ctx,
         tensor_name=output_name,
-        scale=y_scale,
-        zero_point=y_zero,
-        quantized_dimension=0 if np.asarray(y_scale).size <= 1 else _normalize_axis(1, rank),
+        scale=shared_scale_arr,
+        zero_point=shared_zp_arr,
+        quantized_dimension=0,
     )
 
     output_shape = [int(v) for v in first_shape]
@@ -2389,43 +2440,15 @@ def build_qlinear_concat_op(node: Any, ctx: Any) -> None:
     ctx.model_ir.tensors[output_name].shape = list(output_shape)
     ctx.model_ir.tensors[output_name].shape_signature = list(output_signature)
 
-    dq_inputs: list[str] = []
-    for input_name in input_names:
-        dq_name = ctx.add_intermediate_tensor(
-            f"{node.name}_{input_name}_dq",
-            dtype="FLOAT32",
-            shape=ctx.get_tensor_shape(input_name),
-        )
-        ctx.add_operator(
-            OperatorIR(
-                op_type="DEQUANTIZE",
-                inputs=[input_name],
-                outputs=[dq_name],
-            )
-        )
-        dq_inputs.append(dq_name)
-
-    concat_out = ctx.add_intermediate_tensor(
-        f"{node.name}_concat_out",
-        dtype="FLOAT32",
-        shape=list(output_shape),
-    )
     ctx.add_operator(
         OperatorIR(
             op_type="CONCATENATION",
-            inputs=dq_inputs,
-            outputs=[concat_out],
+            inputs=input_names,
+            outputs=[output_name],
             options={
                 "axis": int(axis),
                 "fusedActivationFunction": "NONE",
             },
-        )
-    )
-    ctx.add_operator(
-        OperatorIR(
-            op_type="QUANTIZE",
-            inputs=[concat_out],
-            outputs=[output_name],
         )
     )
 
@@ -2543,43 +2566,13 @@ def build_qlinear_leaky_relu_op(node: Any, ctx: Any) -> None:
         quantized_dimension=0 if np.asarray(y_scale).size <= 1 else _normalize_axis(1, output_rank),
     )
 
-    dq_out = ctx.add_intermediate_tensor(
-        f"{node.name}_dq_out",
-        dtype="FLOAT32",
-        shape=ctx.get_tensor_shape(x_name),
-    )
-    ctx.add_operator(
-        OperatorIR(
-            op_type="DEQUANTIZE",
-            inputs=[x_name],
-            outputs=[dq_out],
-        )
-    )
-
     alpha = float(node.attrs.get("alpha", 0.01))
-    alpha_name = ctx.add_const_tensor(
-        f"{node.name}_alpha",
-        np.asarray([alpha], dtype=np.float32),
-    )
-
-    prelu_out = ctx.add_intermediate_tensor(
-        f"{node.name}_prelu_out",
-        dtype="FLOAT32",
-        shape=ctx.get_tensor_shape(x_name),
-    )
     ctx.add_operator(
         OperatorIR(
-            op_type="PRELU",
-            inputs=[dq_out, alpha_name],
-            outputs=[prelu_out],
-        )
-    )
-
-    ctx.add_operator(
-        OperatorIR(
-            op_type="QUANTIZE",
-            inputs=[prelu_out],
+            op_type="LEAKY_RELU",
+            inputs=[x_name],
             outputs=[output_name],
+            options={"alpha": alpha},
         )
     )
 

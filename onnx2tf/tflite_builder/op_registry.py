@@ -9419,7 +9419,7 @@ _DISPATCH_REGISTRY: Dict[str, DispatchEntry] = {
     ),
     "QLinearConcat": DispatchEntry(
         onnx_op="QLinearConcat",
-        tflite_ops=["DEQUANTIZE", "CONCATENATION", "QUANTIZE"],
+        tflite_ops=["CONCATENATION"],
         builder=build_qlinear_concat_op,
         validation=ValidationSpec(min_inputs=5, min_outputs=1, max_outputs=1),
         extra_validator=_validate_qlinear_concat,
@@ -9478,7 +9478,7 @@ _DISPATCH_REGISTRY: Dict[str, DispatchEntry] = {
     ),
     "QLinearLeakyRelu": DispatchEntry(
         onnx_op="QLinearLeakyRelu",
-        tflite_ops=["DEQUANTIZE", "PRELU", "QUANTIZE"],
+        tflite_ops=["LEAKY_RELU"],
         builder=build_qlinear_leaky_relu_op,
         validation=ValidationSpec(min_inputs=5, max_inputs=5, min_outputs=1, max_outputs=1),
         extra_validator=_validate_qlinear_leaky_relu,
