@@ -1665,3 +1665,27 @@ def write_model_file(
         timing["write_model_file_total_sec"] = float(t3 - t0)
         timing["output_tflite_path"] = str(output_tflite_path)
     return output_tflite_path
+
+
+def write_or_serialize_model_file(
+    *,
+    schema_tflite: Dict[str, Any],
+    model_ir: ModelIR,
+    output_tflite_path: str,
+    in_memory: bool = False,
+    timing: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[str], Optional[bytes]]:
+    if in_memory:
+        model_bytes = serialize_model(
+            schema_tflite=schema_tflite,
+            model_ir=model_ir,
+            timing=timing,
+        )
+        return None, bytes(model_bytes)
+    written_path = write_model_file(
+        schema_tflite=schema_tflite,
+        model_ir=model_ir,
+        output_tflite_path=output_tflite_path,
+        timing=timing,
+    )
+    return written_path, None

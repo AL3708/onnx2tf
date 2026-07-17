@@ -18946,6 +18946,141 @@ def _optimize_transpose_pre_dequant_concat_quantize_post_nhwc_chains(
     return {"optimized_transpose_pre_dequant_concat_quantize_post_nhwc_chains": int(optimized)}
 
 
+_SCALE_TRANSPARENT_OPS = frozenset({
+    "RESIZE_NEAREST_NEIGHBOR",
+    "RESIZE_BILINEAR",
+    "TRANSPOSE",
+    "RESHAPE",
+    "FLATTEN",
+    "SLICE",
+    "STRIDED_SLICE",
+    "TILE",
+    "PAD",
+    "PADV2",
+    "MIRROR_PAD",
+    "SPACE_TO_BATCH_ND",
+    "BATCH_TO_SPACE_ND",
+    "DEPTH_TO_SPACE",
+    "SPACE_TO_DEPTH",
+    "SQUEEZE",
+    "EXPAND_DIMS",
+    "GATHER",
+    "REVERSE_V2",
+})
+
+
+def _fix_concat_input_scales(model_ir: ModelIR) -> int:
+    """Propagate CONCATENATION output scale through scale-transparent chains.
+
+    TFLite INT8 CONCATENATION requires identical scale/zero_point on all inputs
+    and the output. When an input comes through scale-transparent ops
+    (RESIZE_NN, TRANSPOSE, RESHAPE, PAD, …) we walk both directions:
+
+    UP: from the CONCAT input toward its producer — re-stamp y_scale on every
+        transparent tensor until we reach a real quantizing op (CONV, LEAKY_RELU…)
+        or a shared tensor (multiple consumers).
+
+    DOWN: from every tensor we just re-stamped — follow its consumers through
+        any transparent ops and re-stamp those too, so a branching transparent
+        chain (rare) stays consistent.
+    """
+    producers = _build_tensor_producer_map(model_ir)
+    consumers = _build_tensor_consumer_map(model_ir)
+    fixed = 0
+
+    def _stamp(tensor_name: str, quant: Any) -> None:
+        nonlocal fixed
+        t = model_ir.tensors.get(tensor_name)
+        if t is None or t.quantization is None:
+            return
+        if t.quantization == quant:
+            return
+        t.quantization = _clone_quantization(quant)
+        fixed += 1
+
+    def _propagate_down(start_name: str, quant: Any, visited: set, changed_set: set) -> None:
+        """BFS down through scale-transparent consumers.
+
+        Only follows an op downstream if ALL of its inputs are already in
+        changed_set (i.e. we re-stamped them). This prevents propagating into
+        unrelated transparent branches where only the output — but not the
+        input — would get a new scale, creating an input≠output mismatch that
+        forces the VX compiler to insert a TensorCopy kernel.
+        """
+        queue = [start_name]
+        while queue:
+            name = queue.pop()
+            if name in visited:
+                continue
+            visited.add(name)
+            for consumer_idx in consumers.get(name, []):
+                cons_op = model_ir.operators[int(consumer_idx)]
+                if str(cons_op.op_type) not in _SCALE_TRANSPARENT_OPS:
+                    continue
+                # All data inputs of this transparent op must already be stamped;
+                # otherwise we'd create an input≠output scale split on the op.
+                data_inputs = [str(v) for v in cons_op.inputs
+                               if model_ir.tensors.get(str(v)) is not None
+                               and model_ir.tensors[str(v)].quantization is not None]
+                if not all(inp in changed_set for inp in data_inputs):
+                    continue
+                for out_name in [str(v) for v in cons_op.outputs]:
+                    out_t = model_ir.tensors.get(out_name)
+                    if out_t is None or out_t.quantization is None:
+                        continue
+                    if out_t.quantization == quant:
+                        continue
+                    _stamp(out_name, quant)
+                    changed_set.add(out_name)
+                    queue.append(out_name)
+
+    for op in model_ir.operators:
+        if str(op.op_type) != "CONCATENATION":
+            continue
+        out_name = str(op.outputs[0])
+        out_tensor = model_ir.tensors.get(out_name)
+        if out_tensor is None or out_tensor.quantization is None:
+            continue
+        quant = out_tensor.quantization
+
+        for inp_name in [str(v) for v in op.inputs]:
+            inp_tensor = model_ir.tensors.get(inp_name)
+            if inp_tensor is None or inp_tensor.quantization is None:
+                continue
+            if inp_tensor.quantization == quant:
+                continue
+
+            # Walk UP through scale-transparent ops.
+            changed: list[str] = []
+            cur_name = inp_name
+            while True:
+                cur_tensor = model_ir.tensors.get(cur_name)
+                if cur_tensor is None or cur_tensor.quantization is None:
+                    break
+                cur_consumers = consumers.get(cur_name, [])
+                if len(cur_consumers) > 1 and cur_name != inp_name:
+                    break
+                _stamp(cur_name, quant)
+                changed.append(cur_name)
+                prod_idx = producers.get(cur_name)
+                if prod_idx is None:
+                    break
+                prod_op = model_ir.operators[int(prod_idx)]
+                if str(prod_op.op_type) not in _SCALE_TRANSPARENT_OPS:
+                    break
+                if not prod_op.inputs:
+                    break
+                cur_name = str(prod_op.inputs[0])
+
+            # Walk DOWN from every re-stamped tensor through transparent consumers.
+            changed_set: set = set(changed)
+            visited: set = set(changed)
+            for name in changed:
+                _propagate_down(name, quant, visited, changed_set)
+
+    return fixed
+
+
 def _optimize_transpose_concat_nhwc_chains(
     model_ir: ModelIR,
 ) -> Dict[str, int]:
@@ -75978,6 +76113,93 @@ def write_tensor_correspondence_report(
     return output_report_path
 
 
+def _remove_input_transposes(model_ir: ModelIR) -> int:
+    """Remove TRANSPOSE ops fed directly by a model input tensor (keep_inputs_nhwc mode).
+
+    onnx2tf adds a TRANSPOSE after each model input to convert NCHW→NHWC.
+    If the caller provides NHWC data, this TRANSPOSE is unnecessary.
+    This pass rewires model inputs to point at the TRANSPOSE's output (NHWC
+    tensor) and removes the TRANSPOSE op, so the model accepts NHWC directly.
+    """
+    consumers = _build_tensor_consumer_map(model_ir)
+    model_input_names = {str(v) for v in model_ir.inputs}
+    removed = 0
+
+    new_inputs = []
+    ops_to_remove: set[int] = set()
+
+    for inp_name in [str(v) for v in model_ir.inputs]:
+        consumer_indices = consumers.get(inp_name, [])
+        # Look for a single TRANSPOSE consumer with NCHW→NHWC perm.
+        transpose_idx = None
+        for cidx in consumer_indices:
+            op = model_ir.operators[int(cidx)]
+            if str(op.op_type) == "TRANSPOSE" and str(op.inputs[0]) == inp_name:
+                perm = _read_transpose_perm(model_ir, op)
+                if perm in ([0, 2, 3, 1], [0, 3, 1, 2]):  # NCHW→NHWC or NHWC→NCHW
+                    transpose_idx = int(cidx)
+                    break
+        if transpose_idx is None:
+            new_inputs.append(inp_name)
+            continue
+        trans_op = model_ir.operators[transpose_idx]
+        nhwc_name = str(trans_op.outputs[0])
+        new_inputs.append(nhwc_name)
+        ops_to_remove.add(transpose_idx)
+        removed += 1
+
+    if removed:
+        model_ir.inputs = new_inputs
+        model_ir.operators = [
+            op for idx, op in enumerate(model_ir.operators)
+            if idx not in ops_to_remove
+        ]
+        _prune_unused_tensors(model_ir)
+
+    return removed
+
+
+def _remove_output_transposes(model_ir: ModelIR) -> int:
+    """Remove TRANSPOSE ops whose output is a model output tensor (keep_outputs_nhwc mode).
+
+    When the model outputs NCHW tensors, onnx2tf adds a final TRANSPOSE to
+    convert from internal NHWC back to NCHW. If the consumer can handle NHWC,
+    these TRANSPOSEs are unnecessary. This pass rewires model outputs to point
+    directly at the TRANSPOSE's input (NHWC tensor) and removes the TRANSPOSE op.
+    """
+    producers = _build_tensor_producer_map(model_ir)
+    model_output_names = {str(v) for v in model_ir.outputs}
+    removed = 0
+
+    new_outputs = []
+    ops_to_remove: set[int] = set()
+
+    for out_name in [str(v) for v in model_ir.outputs]:
+        prod_idx = producers.get(out_name)
+        if prod_idx is None:
+            new_outputs.append(out_name)
+            continue
+        prod_op = model_ir.operators[int(prod_idx)]
+        if str(prod_op.op_type) != "TRANSPOSE" or len(prod_op.inputs) < 1:
+            new_outputs.append(out_name)
+            continue
+        # Replace model output with the TRANSPOSE's input (NHWC tensor).
+        nhwc_name = str(prod_op.inputs[0])
+        new_outputs.append(nhwc_name)
+        ops_to_remove.add(int(prod_idx))
+        removed += 1
+
+    if removed:
+        model_ir.outputs = new_outputs
+        model_ir.operators = [
+            op for idx, op in enumerate(model_ir.operators)
+            if idx not in ops_to_remove
+        ]
+        _prune_unused_tensors(model_ir)
+
+    return removed
+
+
 def lower_onnx_to_ir(
     onnx_graph: onnx.ModelProto,
     output_file_name: str,
@@ -76006,6 +76228,8 @@ def lower_onnx_to_ir(
     fused_argmax_scale_ratio: float = 0.5,
     replace_to_pseudo_operators: Optional[List[str]] = None,
     protected_boundary_tensor_names: Optional[List[str]] = None,
+    keep_outputs_nhwc: bool = False,
+    keep_inputs_nhwc: bool = False,
 ) -> ModelIR:
     onnx_graph = _infer_shapes_with_fallback(onnx_graph)
 
@@ -77027,6 +77251,7 @@ def lower_onnx_to_ir(
     _optimize_transpose_axis3_const_concat_bridge_nhwc_chains(model_ir)
     _optimize_transpose_pre_dequant_concat_quantize_post_nhwc_chains(model_ir)
     _optimize_transpose_concat_nhwc_chains(model_ir)
+    _fix_concat_input_scales(model_ir)
     _optimize_transpose_layernorm_stats_nhwc_propagation_chains(model_ir)
     _optimize_layernorm_stats_via_existing_post_transpose_nhwc_chains(model_ir)
     _optimize_layout_transpose_chains(model_ir)
@@ -77110,6 +77335,7 @@ def lower_onnx_to_ir(
     _optimize_transpose_dequant_hardsigmoid_quantize_bridges(model_ir)
     _optimize_transpose_pre_dequant_concat_quantize_post_nhwc_chains(model_ir)
     _optimize_transpose_concat_nhwc_chains(model_ir)
+    _fix_concat_input_scales(model_ir)
     # Some late specialized rewrites can still leave trivial
     # NHWC->NCHW->NHWC wrappers around unary activations.
     # Run one final strict unary transpose fold before serialization guards.
@@ -77448,5 +77674,10 @@ def lower_onnx_to_ir(
     if post_progress_bar is not None:
         post_progress_spinner.stop()
         post_progress_bar.close()
+
+    if keep_inputs_nhwc:
+        _remove_input_transposes(model_ir)
+    if keep_outputs_nhwc:
+        _remove_output_transposes(model_ir)
 
     return model_ir

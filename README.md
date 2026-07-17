@@ -285,10 +285,27 @@ falling back to `tf_converter`.
 
 `--disable_model_save` also stays on the direct path. In `flatbuffer_direct`, it means the conversion can still run internal validation and temporary staging, but no final artifacts are left in the requested output directory.
 
+`-sf32`/`--skip_float32_tflite` and `-sf16`/`--skip_float16_tflite` skip writing the corresponding
+`*_float32.tflite`/`*_float16.tflite` file. Quantized variants (`-odrqt`/`-oiqt`) are built from the
+original ModelIR, not from the float32/float16 output, so skipping either one does not affect
+quantized output. Only supported with `--tflite_backend flatbuffer_direct`.
+
+The Python API also accepts `in_memory=True` on `convert()` (no CLI flag). Instead of writing
+`.tflite` files to `output_folder_path`, it returns a dict of the generated variants as raw bytes,
+e.g. `{'float32': b'...', 'integer_quant': b'...'}`, ready to hand to
+`ai_edge_litert.interpreter.Interpreter(model_content=...)`. Only supported with
+`tflite_backend="flatbuffer_direct"`. `in_memory=True` alone does not guarantee zero disk I/O —
+diagnostic report JSON files still get written to `output_folder_path` unless combined with
+`disable_model_save=True`, which redirects everything to an auto-cleaned temporary directory.
+
 Invalid combinations are rejected explicitly:
 
 - `--disable_model_save` with `--output_h5`, `--output_keras_v3`, or `--output_tfv1_pb`
 - `--enable_auto_split_model` with `--output_h5`, `--output_keras_v3`, or `--output_tfv1_pb`
+- `--skip_float32_tflite`/`--skip_float16_tflite`/`in_memory=True` with `--tflite_backend tf_converter`
+- `--skip_float32_tflite` and `--skip_float16_tflite` together with no `-odrqt`/`-oiqt` requested
+- `--output_weights` with `--skip_float32_tflite`/`--skip_float16_tflite`
+- `in_memory=True` with `--output_weights`, `--enable_auto_split_model`, `eval_split_models`, `--eval_with_onnx`, or `--check_onnx_tf_outputs_elementwise_close`
 
 SavedModel direct export from `flatbuffer_direct` ModelIR is available with
 `--flatbuffer_direct_output_saved_model`.
@@ -2307,6 +2324,14 @@ optional arguments:
   -oiqt, --output_integer_quantized_tflite
     Output of integer quantized tflite.
 
+  -sf32, --skip_float32_tflite
+    Skip generation of the float32 tflite output.
+    Only supported with --tflite_backend flatbuffer_direct.
+
+  -sf16, --skip_float16_tflite
+    Skip generation of the float16 tflite output.
+    Only supported with --tflite_backend flatbuffer_direct.
+
   -tb {tf_converter,flatbuffer_direct}, \
     --tflite_backend {tf_converter,flatbuffer_direct}
     TFLite generation backend.
@@ -3078,6 +3103,18 @@ convert(
     output_integer_quantized_tflite: Optional[bool]
       Output of integer quantized tflite.
 
+    skip_float32_tflite: Optional[bool]
+      Skip generation of the float32 tflite output.
+      Only supported with `tflite_backend="flatbuffer_direct"`.
+      Cannot be combined with `output_weights=True`.
+      Default: False
+
+    skip_float16_tflite: Optional[bool]
+      Skip generation of the float16 tflite output.
+      Only supported with `tflite_backend="flatbuffer_direct"`.
+      Cannot be combined with `output_weights=True`.
+      Default: False
+
     tflite_backend: Optional[str]
       TFLite generation backend.
       "flatbuffer_direct"(default): Experimental direct FlatBuffer builder path.
@@ -3660,6 +3697,21 @@ convert(
       With `tflite_backend="flatbuffer_direct"`, conversion may still use
       temporary staging and validation internally, but no final artifacts are
       left in `output_folder_path`.
+      Default: False
+
+    in_memory: Optional[bool]
+      Return in-memory tflite bytes instead of writing to disk. Returns a dict of
+      `{'float32': bytes, 'float16': bytes, ...}` (only the requested/generated
+      variants) instead of the usual `tf_keras.Model`/`None`. Only supported with
+      `tflite_backend="flatbuffer_direct"`. No CLI flag (Python API only).
+      Diagnostic report JSON files (tensor correspondence report, op coverage report)
+      still get written to `output_folder_path` unless combined with
+      `disable_model_save=True`, which redirects everything to an auto-cleaned
+      temporary directory. Recommend `in_memory=True` + `disable_model_save=True`
+      together for fully disk-free operation.
+      Cannot be combined with `output_weights=True`, `enable_auto_split_model=True`,
+      `eval_split_models`, `eval_with_onnx=True`, or
+      `check_onnx_tf_outputs_elementwise_close_full=True` (raises `ValueError`).
       Default: False
 
     non_verbose: Optional[bool]

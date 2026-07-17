@@ -1296,6 +1296,8 @@ def convert(
     copy_onnx_input_output_names_to_tflite: Optional[bool] = False,
     output_dynamic_range_quantized_tflite: Optional[bool] = False,
     output_integer_quantized_tflite: Optional[bool] = False,
+    skip_float32_tflite: Optional[bool] = False,
+    skip_float16_tflite: Optional[bool] = False,
     eval_with_onnx: Optional[bool] = False,
     eval_num_samples: Optional[int] = 10,
     eval_rtol: Optional[float] = 1e-4,
@@ -1372,8 +1374,11 @@ def convert(
     test_data_nhwc_path: Optional[str] = None,
     mvn_epsilon: Optional[float] = 0.0000000001,
     disable_model_save: Optional[bool] = False,
+    in_memory: Optional[bool] = False,
     non_verbose: Optional[bool] = False,
     verbosity: Optional[str] = 'debug',
+    keep_inputs_nhwc: Optional[bool] = False,
+    keep_outputs_nhwc: Optional[bool] = False,
 ) -> KerasModel:
     """Convert ONNX to TensorFlow models.
 
@@ -1440,6 +1445,14 @@ def convert(
 
     output_integer_quantized_tflite: Optional[bool]
         Output of integer quantized tflite.
+
+    skip_float32_tflite: Optional[bool]
+        Skip generation of the float32 tflite output. Only supported with tflite_backend="flatbuffer_direct".\n
+        Default: False
+
+    skip_float16_tflite: Optional[bool]
+        Skip generation of the float16 tflite output. Only supported with tflite_backend="flatbuffer_direct".\n
+        Default: False
 
     eval_with_onnx: Optional[bool]
         Evaluate generated float32 tflite output against ONNX output and
@@ -1983,6 +1996,20 @@ def convert(
         Does not save the converted model. For CIs RAM savings.\n
         Default: False
 
+    in_memory: Optional[bool]
+        Return in-memory tflite bytes instead of writing to disk. Returns a dict of\n
+        {'float32': bytes, 'float16': bytes, ...} (or similar) instead of the usual\n
+        tf_keras.Model/None. Only supported with tflite_backend="flatbuffer_direct".\n
+        Diagnostic report JSON files (tensor correspondence report, op coverage report)\n
+        still get written to output_folder_path unless combined with disable_model_save=True,\n
+        which redirects everything to an auto-cleaned temporary directory. Recommend\n
+        in_memory=True + disable_model_save=True together for fully disk-free operation.\n
+        Cannot be combined with output_weights, enable_auto_split_model, eval_split_models,\n
+        eval_with_onnx, or check_onnx_tf_outputs_elementwise_close_full (raises ValueError).\n
+        Note: in_memory=True + eval_with_onnx/accuracy-checking is not yet supported\n
+        but is a natural future extension.\n
+        Default: False
+
     non_verbose: Optional[bool]
         Shorthand to specify a verbosity of "error".\n
         Default: False
@@ -2055,6 +2082,38 @@ def convert(
             f'tflite_backend: {tflite_backend}'
         )
         sys.exit(1)
+
+    # Validate skip/in_memory parameters
+    skip_float32_tflite = bool(skip_float32_tflite)
+    skip_float16_tflite = bool(skip_float16_tflite)
+    in_memory = bool(in_memory)
+
+    if (skip_float32_tflite or skip_float16_tflite or in_memory) and tflite_backend != 'flatbuffer_direct':
+        raise ValueError(
+            'skip_float32_tflite/skip_float16_tflite/in_memory require tflite_backend="flatbuffer_direct".'
+        )
+    if (
+        skip_float32_tflite and skip_float16_tflite
+        and not output_dynamic_range_quantized_tflite and not output_integer_quantized_tflite
+    ):
+        raise ValueError(
+            'skip_float32_tflite and skip_float16_tflite with no quantized output requested '
+            'would produce zero tflite output files.'
+        )
+    if output_weights and (skip_float32_tflite or skip_float16_tflite):
+        raise ValueError(
+            'output_weights requires the corresponding float32/float16 tflite file; '
+            'cannot combine with skip_float32_tflite/skip_float16_tflite.'
+        )
+    if in_memory and (
+        output_weights or enable_auto_split_model or eval_split_models is not None
+        or eval_with_onnx or check_onnx_tf_outputs_elementwise_close_full
+    ):
+        raise ValueError(
+            'in_memory=True cannot be combined with output_weights, enable_auto_split_model, '
+            'eval_split_models, eval_with_onnx, or check_onnx_tf_outputs_elementwise_close_full.'
+        )
+
     eval_with_onnx = bool(eval_with_onnx)
     eval_num_samples = int(eval_num_samples)
     eval_rtol = float(eval_rtol)
@@ -5838,6 +5897,43 @@ def convert(
                 )
             )
 
+    def _build_in_memory_tflite_result(direct_outputs: Dict[str, Any]) -> Dict[str, bytes]:
+        variant_keys = [
+            ('float32', 'float32_tflite_bytes'),
+            ('float16', 'float16_tflite_bytes'),
+            ('dynamic_range_quant', 'dynamic_range_quant_tflite_bytes'),
+            ('integer_quant', 'integer_quant_tflite_bytes'),
+            ('full_integer_quant', 'full_integer_quant_tflite_bytes'),
+            ('integer_quant_with_int16_act', 'integer_quant_with_int16_act_tflite_bytes'),
+            ('full_integer_quant_with_int16_act', 'full_integer_quant_with_int16_act_tflite_bytes'),
+        ]
+        return {
+            name: direct_outputs[bytes_key]
+            for name, bytes_key in variant_keys
+            if direct_outputs.get(bytes_key) is not None
+        }
+
+    _VARIANT_LABELS = {
+        'float32': 'Float32 tflite',
+        'float16': 'Float16 tflite',
+        'dynamic_range_quant': 'Dynamic Range Quantization tflite',
+        'integer_quant': 'INT8 Quantization tflite',
+        'full_integer_quant': 'Full INT8 Quantization tflite',
+        'integer_quant_with_int16_act': 'INT8 Quantization with int16 activations tflite',
+        'full_integer_quant_with_int16_act': 'Full INT8 Quantization with int16 activations tflite',
+    }
+
+    def _report_variant_complete(direct_outputs: Dict[str, Any], name: str) -> None:
+        path = direct_outputs.get(f'{name}_tflite_path')
+        if path is not None:
+            info(Color.GREEN(f'{_VARIANT_LABELS[name]} output complete! ({path})'))
+        elif direct_outputs.get(f'{name}_tflite_bytes') is not None:
+            info(Color.GREEN(f'{_VARIANT_LABELS[name]} output complete! (in-memory bytes, not written to disk)'))
+
+    def _require_variant_output(direct_outputs: Dict[str, Any], name: str, what: str) -> None:
+        if direct_outputs.get(f'{name}_tflite_path') is None and direct_outputs.get(f'{name}_tflite_bytes') is None:
+            raise RuntimeError(f'flatbuffer_direct {what} was requested but no output was generated.')
+
     def _run_flatbuffer_direct_export(
         *,
         export_output_folder_path: str,
@@ -5912,6 +6008,11 @@ def convert(
                         replace_argmax_to_fused_argmax_and_indices_is_float32=replace_argmax_to_fused_argmax_and_indices_is_float32,
                         fused_argmax_scale_ratio=fused_argmax_scale_ratio,
                         replace_to_pseudo_operators=replace_to_pseudo_operators,
+                        skip_float32_tflite=skip_float32_tflite,
+                        skip_float16_tflite=skip_float16_tflite,
+                        in_memory=in_memory,
+                        keep_inputs_nhwc=keep_inputs_nhwc,
+                        keep_outputs_nhwc=keep_outputs_nhwc,
                     )
                     if direct_output_nms_with_argmax and not output_nms_with_argmax:
                         info(
@@ -5981,8 +6082,8 @@ def convert(
         source_label: str,
         export_artifact_folder_path: str,
     ) -> None:
-        info(Color.GREEN(f'Float32 tflite output complete! ({direct_outputs["float32_tflite_path"]})'))
-        info(Color.GREEN(f'Float16 tflite output complete! ({direct_outputs["float16_tflite_path"]})'))
+        _report_variant_complete(direct_outputs, 'float32')
+        _report_variant_complete(direct_outputs, 'float16')
         if 'saved_model_path' in direct_outputs:
             saved_model_message = (
                 'SavedModel output complete! '
@@ -6123,57 +6224,17 @@ def convert(
                 )
             )
         if output_dynamic_range_quantized_tflite:
-            if 'dynamic_range_quant_tflite_path' not in direct_outputs:
-                raise RuntimeError(
-                    'flatbuffer_direct dynamic-range quantization was requested but no output was generated.'
-                )
-            info(
-                Color.GREEN(
-                    f'Dynamic Range Quantization tflite output complete! '
-                    f'({direct_outputs["dynamic_range_quant_tflite_path"]})'
-                )
-            )
+            _require_variant_output(direct_outputs, 'dynamic_range_quant', 'dynamic-range quantization')
+            _report_variant_complete(direct_outputs, 'dynamic_range_quant')
         if output_integer_quantized_tflite:
-            if 'integer_quant_tflite_path' not in direct_outputs:
-                raise RuntimeError(
-                    'flatbuffer_direct integer quantization was requested but no output was generated.'
-                )
-            if 'full_integer_quant_tflite_path' not in direct_outputs:
-                raise RuntimeError(
-                    'flatbuffer_direct full integer quantization was requested but no output was generated.'
-                )
-            if 'integer_quant_with_int16_act_tflite_path' not in direct_outputs:
-                raise RuntimeError(
-                    'flatbuffer_direct integer quantization with int16 activations was requested but no output was generated.'
-                )
-            if 'full_integer_quant_with_int16_act_tflite_path' not in direct_outputs:
-                raise RuntimeError(
-                    'flatbuffer_direct full integer quantization with int16 activations was requested but no output was generated.'
-                )
-            info(
-                Color.GREEN(
-                    f'INT8 Quantization tflite output complete! '
-                    f'({direct_outputs["integer_quant_tflite_path"]})'
-                )
-            )
-            info(
-                Color.GREEN(
-                    f'Full INT8 Quantization tflite output complete! '
-                    f'({direct_outputs["full_integer_quant_tflite_path"]})'
-                )
-            )
-            info(
-                Color.GREEN(
-                    f'INT8 Quantization with int16 activations tflite output complete! '
-                    f'({direct_outputs["integer_quant_with_int16_act_tflite_path"]})'
-                )
-            )
-            info(
-                Color.GREEN(
-                    f'Full INT8 Quantization with int16 activations tflite output complete! '
-                    f'({direct_outputs["full_integer_quant_with_int16_act_tflite_path"]})'
-                )
-            )
+            for variant_name, variant_what in [
+                ('integer_quant', 'integer quantization'),
+                ('full_integer_quant', 'full integer quantization'),
+                ('integer_quant_with_int16_act', 'integer quantization with int16 activations'),
+                ('full_integer_quant_with_int16_act', 'full integer quantization with int16 activations'),
+            ]:
+                _require_variant_output(direct_outputs, variant_name, variant_what)
+                _report_variant_complete(direct_outputs, variant_name)
         if copy_onnx_input_output_names_to_tflite:
             info(
                 'Input/Output tensor names are directly written from ONNX graph in flatbuffer_direct backend.'
@@ -6203,19 +6264,19 @@ def convert(
             contains_custom_ops=direct_contains_custom_ops,
         )
         direct_eval_paths = {}
-        if 'float32_tflite_path' in direct_outputs:
+        if direct_outputs.get('float32_tflite_path') is not None:
             direct_eval_paths['float32'] = direct_outputs['float32_tflite_path']
-        if 'float16_tflite_path' in direct_outputs:
+        if direct_outputs.get('float16_tflite_path') is not None:
             direct_eval_paths['float16'] = direct_outputs['float16_tflite_path']
-        if 'dynamic_range_quant_tflite_path' in direct_outputs:
+        if direct_outputs.get('dynamic_range_quant_tflite_path') is not None:
             direct_eval_paths['dynamic_range_quant'] = direct_outputs['dynamic_range_quant_tflite_path']
-        if 'integer_quant_tflite_path' in direct_outputs:
+        if direct_outputs.get('integer_quant_tflite_path') is not None:
             direct_eval_paths['integer_quant'] = direct_outputs['integer_quant_tflite_path']
-        if 'full_integer_quant_tflite_path' in direct_outputs:
+        if direct_outputs.get('full_integer_quant_tflite_path') is not None:
             direct_eval_paths['full_integer_quant'] = direct_outputs['full_integer_quant_tflite_path']
-        if 'integer_quant_with_int16_act_tflite_path' in direct_outputs:
+        if direct_outputs.get('integer_quant_with_int16_act_tflite_path') is not None:
             direct_eval_paths['integer_quant_with_int16_act'] = direct_outputs['integer_quant_with_int16_act_tflite_path']
-        if 'full_integer_quant_with_int16_act_tflite_path' in direct_outputs:
+        if direct_outputs.get('full_integer_quant_with_int16_act_tflite_path') is not None:
             direct_eval_paths['full_integer_quant_with_int16_act'] = direct_outputs['full_integer_quant_with_int16_act_tflite_path']
         tflite_eval_result = _run_onnx_tflite_output_check(
             tflite_paths=direct_eval_paths,
@@ -6317,7 +6378,7 @@ def convert(
                 source_label='flatbuffer_direct',
                 export_artifact_folder_path=output_folder_path,
             )
-            return None
+            return _build_in_memory_tflite_result(direct_outputs) if in_memory else None
         finally:
             if flatbuffer_direct_bridge_saved_model_dir is not None:
                 flatbuffer_direct_bridge_saved_model_dir.cleanup()
@@ -6793,6 +6854,8 @@ def convert(
                                     replace_argmax_to_fused_argmax_and_indices_is_float32=replace_argmax_to_fused_argmax_and_indices_is_float32,
                                     fused_argmax_scale_ratio=fused_argmax_scale_ratio,
                                     replace_to_pseudo_operators=replace_to_pseudo_operators,
+                                    keep_inputs_nhwc=keep_inputs_nhwc,
+                                    keep_outputs_nhwc=keep_outputs_nhwc,
                                 )
                                 if direct_output_nms_with_argmax and not output_nms_with_argmax:
                                     info(
@@ -7270,6 +7333,8 @@ def convert(
                                 replace_argmax_to_fused_argmax_and_indices_is_float32=replace_argmax_to_fused_argmax_and_indices_is_float32,
                                 fused_argmax_scale_ratio=fused_argmax_scale_ratio,
                                 replace_to_pseudo_operators=replace_to_pseudo_operators,
+                                keep_inputs_nhwc=keep_inputs_nhwc,
+                                keep_outputs_nhwc=keep_outputs_nhwc,
                             )
                             if direct_output_nms_with_argmax and not output_nms_with_argmax:
                                 info(
@@ -8479,6 +8544,22 @@ def main():
             'Output of integer quantized tflite.'
     )
     parser.add_argument(
+        '-sf32',
+        '--skip_float32_tflite',
+        action='store_true',
+        help=\
+            'Skip generation of the float32 tflite output. \n' +
+            'Only supported with --tflite_backend flatbuffer_direct.'
+    )
+    parser.add_argument(
+        '-sf16',
+        '--skip_float16_tflite',
+        action='store_true',
+        help=\
+            'Skip generation of the float16 tflite output. \n' +
+            'Only supported with --tflite_backend flatbuffer_direct.'
+    )
+    parser.add_argument(
         '-tb',
         '--tflite_backend',
         type=str,
@@ -9409,6 +9490,8 @@ def main():
             copy_onnx_input_output_names_to_tflite=args.copy_onnx_input_output_names_to_tflite,
             output_dynamic_range_quantized_tflite=args.output_dynamic_range_quantized_tflite,
             output_integer_quantized_tflite=args.output_integer_quantized_tflite,
+            skip_float32_tflite=args.skip_float32_tflite,
+            skip_float16_tflite=args.skip_float16_tflite,
             eval_with_onnx=args.eval_with_onnx,
             eval_num_samples=args.eval_num_samples,
             eval_rtol=args.eval_rtol,

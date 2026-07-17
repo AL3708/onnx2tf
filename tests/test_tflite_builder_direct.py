@@ -170,7 +170,7 @@ from onnx2tf.tflite_builder.lower_from_onnx2tf import (
     lower_onnx_to_ir,
 )
 from onnx2tf.utils.common_functions import check_model_has_external_data
-from onnx2tf.tflite_builder.model_writer import serialize_model
+from onnx2tf.tflite_builder.model_writer import serialize_model, write_or_serialize_model_file
 from onnx2tf.tflite_builder.preprocess import (
     configure_pseudo_ops_wave1_targets,
     get_supported_pseudo_ops_wave1_aliases,
@@ -40240,3 +40240,337 @@ def test_flatbuffer_direct_loss_builtin_parity() -> None:
                     rtol=1e-4,
                     atol=1e-4,
                 )
+
+
+@pytest.mark.skipif(not _requires_flatbuffer_tools(), reason="flatbuffer_direct requires bundled schema artifacts")
+def test_write_or_serialize_model_file_writes_disk_by_default() -> None:
+    """Test that write_or_serialize_model_file writes to disk when in_memory=False."""
+    model_ir = ModelIR(name="write_disk_test")
+    model_ir.inputs = ["x", "y"]
+    model_ir.outputs = ["z"]
+    model_ir.tensors["x"] = TensorIR(name="x", dtype="FLOAT32", shape=[1, 3])
+    model_ir.tensors["y"] = TensorIR(name="y", dtype="FLOAT32", shape=[1, 3])
+    model_ir.tensors["z"] = TensorIR(name="z", dtype="FLOAT32", shape=[1, 3])
+    model_ir.tensors["c"] = TensorIR(
+        name="c",
+        dtype="FLOAT32",
+        shape=[1, 3],
+        data=np.array([[1.0, 2.0, 3.0]], dtype=np.float32),
+    )
+    model_ir.operators = [
+        OperatorIR(op_type="ADD", inputs=["x", "y"], outputs=["z"]),
+    ]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        schema_tflite = load_schema_module(tmpdir)
+        output_path = os.path.join(tmpdir, "out.tflite")
+        path, bytes_result = write_or_serialize_model_file(
+            schema_tflite=schema_tflite,
+            model_ir=model_ir,
+            output_tflite_path=output_path,
+            in_memory=False,
+        )
+        assert path == output_path
+        assert bytes_result is None
+        assert os.path.exists(output_path)
+        assert os.path.getsize(output_path) > 0
+
+
+@pytest.mark.skipif(not _requires_flatbuffer_tools(), reason="flatbuffer_direct requires bundled schema artifacts")
+def test_write_or_serialize_model_file_returns_bytes_when_in_memory() -> None:
+    """Test that write_or_serialize_model_file returns bytes when in_memory=True."""
+    model_ir = ModelIR(name="write_memory_test")
+    model_ir.inputs = ["x", "y"]
+    model_ir.outputs = ["z"]
+    model_ir.tensors["x"] = TensorIR(name="x", dtype="FLOAT32", shape=[1, 3])
+    model_ir.tensors["y"] = TensorIR(name="y", dtype="FLOAT32", shape=[1, 3])
+    model_ir.tensors["z"] = TensorIR(name="z", dtype="FLOAT32", shape=[1, 3])
+    model_ir.tensors["c"] = TensorIR(
+        name="c",
+        dtype="FLOAT32",
+        shape=[1, 3],
+        data=np.array([[1.0, 2.0, 3.0]], dtype=np.float32),
+    )
+    model_ir.operators = [
+        OperatorIR(op_type="ADD", inputs=["x", "y"], outputs=["z"]),
+    ]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        schema_tflite = load_schema_module(tmpdir)
+        unused_path = os.path.join(tmpdir, "unused.tflite")
+        path, bytes_result = write_or_serialize_model_file(
+            schema_tflite=schema_tflite,
+            model_ir=model_ir,
+            output_tflite_path=unused_path,
+            in_memory=True,
+        )
+        assert path is None
+        assert isinstance(bytes_result, bytes)
+        assert len(bytes_result) > 0
+        assert not os.path.exists(unused_path)
+        # Verify bytes are valid TFLite
+        model_obj = schema_tflite["Model"].GetRootAsModel(bytes_result, 0)
+        assert model_obj is not None
+
+
+@pytest.mark.skipif(not _requires_flatbuffer_tools(), reason="flatbuffer_direct requires bundled schema artifacts")
+def test_flatbuffer_direct_skip_float32_tflite_omits_file_and_bytes() -> None:
+    """Test that skip_float32_tflite=True omits float32 file but produces other variants."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model = _make_gemm_model()
+        model_path = _save_model(tmpdir, "gemm_skip_float32", model)
+        out_dir = os.path.join(tmpdir, "out")
+        model_name = os.path.splitext(os.path.basename(model_path))[0]
+        _convert(
+            model_path,
+            out_dir,
+            "flatbuffer_direct",
+            skip_float32_tflite=True,
+            output_integer_quantized_tflite=True,
+        )
+        assert not os.path.exists(os.path.join(out_dir, f"{model_name}_float32.tflite"))
+        assert os.path.exists(os.path.join(out_dir, f"{model_name}_float16.tflite"))
+        assert os.path.exists(os.path.join(out_dir, f"{model_name}_integer_quant.tflite"))
+
+
+@pytest.mark.skipif(not _requires_flatbuffer_tools(), reason="flatbuffer_direct requires bundled schema artifacts")
+def test_flatbuffer_direct_skip_float16_tflite_omits_file() -> None:
+    """Test that skip_float16_tflite=True omits float16 file."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model = _make_gemm_model()
+        model_path = _save_model(tmpdir, "gemm_skip_float16", model)
+        out_dir = os.path.join(tmpdir, "out")
+        model_name = os.path.splitext(os.path.basename(model_path))[0]
+        _convert(
+            model_path,
+            out_dir,
+            "flatbuffer_direct",
+            skip_float16_tflite=True,
+            output_dynamic_range_quantized_tflite=True,
+        )
+        assert os.path.exists(os.path.join(out_dir, f"{model_name}_float32.tflite"))
+        assert not os.path.exists(os.path.join(out_dir, f"{model_name}_float16.tflite"))
+        assert os.path.exists(os.path.join(out_dir, f"{model_name}_dynamic_range_quant.tflite"))
+
+
+@pytest.mark.skipif(not _requires_flatbuffer_tools(), reason="flatbuffer_direct requires bundled schema artifacts")
+def test_flatbuffer_direct_skip_both_requires_quant_output() -> None:
+    """Test that skipping both float32 and float16 requires quantization output."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model = _make_add_chain_model()
+        model_path = _save_model(tmpdir, "add_chain_skip_both", model)
+        out_dir = os.path.join(tmpdir, "out")
+        with pytest.raises(ValueError):
+            _convert(
+                model_path,
+                out_dir,
+                "flatbuffer_direct",
+                skip_float32_tflite=True,
+                skip_float16_tflite=True,
+            )
+
+
+@pytest.mark.skipif(not _requires_flatbuffer_tools(), reason="flatbuffer_direct requires bundled schema artifacts")
+def test_flatbuffer_direct_skip_flags_require_flatbuffer_direct_backend() -> None:
+    """Test that skip_float32_tflite requires flatbuffer_direct backend."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model = _make_add_chain_model()
+        model_path = _save_model(tmpdir, "add_chain_skip_tf_backend", model)
+        out_dir = os.path.join(tmpdir, "out")
+        with pytest.raises(ValueError):
+            _convert(
+                model_path,
+                out_dir,
+                "tf_converter",
+                skip_float32_tflite=True,
+            )
+
+
+@pytest.mark.skipif(not _requires_flatbuffer_tools(), reason="flatbuffer_direct requires bundled schema artifacts")
+def test_flatbuffer_direct_output_weights_rejects_skip_float32() -> None:
+    """Test that output_weights=True rejects skip_float32_tflite=True."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model = _make_add_chain_model()
+        model_path = _save_model(tmpdir, "add_chain_weights_skip_float32", model)
+        out_dir = os.path.join(tmpdir, "out")
+        with pytest.raises(ValueError):
+            _convert(
+                model_path,
+                out_dir,
+                "flatbuffer_direct",
+                output_weights=True,
+                skip_float32_tflite=True,
+            )
+
+
+@pytest.mark.skipif(not _requires_flatbuffer_tools(), reason="flatbuffer_direct requires bundled schema artifacts")
+def test_flatbuffer_direct_output_weights_rejects_skip_float16() -> None:
+    """Test that output_weights=True rejects skip_float16_tflite=True."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model = _make_add_chain_model()
+        model_path = _save_model(tmpdir, "add_chain_weights_skip_float16", model)
+        out_dir = os.path.join(tmpdir, "out")
+        with pytest.raises(ValueError):
+            _convert(
+                model_path,
+                out_dir,
+                "flatbuffer_direct",
+                output_weights=True,
+                skip_float16_tflite=True,
+            )
+
+
+@pytest.mark.skipif(not _requires_flatbuffer_tools(), reason="flatbuffer_direct requires bundled schema artifacts")
+def test_flatbuffer_direct_in_memory_returns_bytes_dict_no_files_written() -> None:
+    """Test that in_memory=True returns dict of bytes and writes no .tflite files."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model = _make_add_chain_model()
+        model_path = _save_model(tmpdir, "add_chain_in_memory", model)
+        out_dir = os.path.join(tmpdir, "out")
+        result = onnx2tf.convert(
+            input_onnx_file_path=model_path,
+            output_folder_path=out_dir,
+            disable_strict_mode=True,
+            verbosity="error",
+            tflite_backend="flatbuffer_direct",
+            in_memory=True,
+        )
+        assert isinstance(result, dict)
+        assert "float32" in result
+        assert isinstance(result["float32"], bytes)
+        assert len(result["float32"]) > 0
+        assert "float16" in result
+        assert isinstance(result["float16"], bytes)
+        assert len(result["float16"]) > 0
+        # Verify we can parse the bytes
+        interpreter = Interpreter(model_content=result["float32"])
+        interpreter.allocate_tensors()
+        # Verify no .tflite files were written to disk
+        tflite_files = glob.glob(os.path.join(out_dir, "*.tflite"))
+        assert len(tflite_files) == 0
+
+
+@pytest.mark.skipif(not _requires_flatbuffer_tools(), reason="flatbuffer_direct requires bundled schema artifacts")
+def test_flatbuffer_direct_in_memory_with_quant_returns_all_variants() -> None:
+    """Test that in_memory=True returns all requested quantization variants."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model = _make_gemm_model()
+        model_path = _save_model(tmpdir, "gemm_in_memory_quant", model)
+        out_dir = os.path.join(tmpdir, "out")
+        result = onnx2tf.convert(
+            input_onnx_file_path=model_path,
+            output_folder_path=out_dir,
+            disable_strict_mode=True,
+            verbosity="error",
+            tflite_backend="flatbuffer_direct",
+            in_memory=True,
+            output_dynamic_range_quantized_tflite=True,
+            output_integer_quantized_tflite=True,
+        )
+        assert isinstance(result, dict)
+        assert "float32" in result and isinstance(result["float32"], bytes) and len(result["float32"]) > 0
+        assert "float16" in result and isinstance(result["float16"], bytes) and len(result["float16"]) > 0
+        assert "dynamic_range_quant" in result and isinstance(result["dynamic_range_quant"], bytes) and len(result["dynamic_range_quant"]) > 0
+        assert "integer_quant" in result and isinstance(result["integer_quant"], bytes) and len(result["integer_quant"]) > 0
+        assert "full_integer_quant" in result and isinstance(result["full_integer_quant"], bytes) and len(result["full_integer_quant"]) > 0
+        # Verify no .tflite files were written to disk
+        tflite_files = glob.glob(os.path.join(out_dir, "*.tflite"))
+        assert len(tflite_files) == 0
+
+
+@pytest.mark.skipif(not _requires_flatbuffer_tools(), reason="flatbuffer_direct requires bundled schema artifacts")
+def test_flatbuffer_direct_in_memory_rejects_output_weights() -> None:
+    """Test that in_memory=True rejects output_weights=True."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model = _make_add_chain_model()
+        model_path = _save_model(tmpdir, "add_chain_in_memory_weights", model)
+        out_dir = os.path.join(tmpdir, "out")
+        with pytest.raises(ValueError):
+            onnx2tf.convert(
+                input_onnx_file_path=model_path,
+                output_folder_path=out_dir,
+                disable_strict_mode=True,
+                verbosity="error",
+                tflite_backend="flatbuffer_direct",
+                in_memory=True,
+                output_weights=True,
+            )
+
+
+@pytest.mark.skipif(not _requires_flatbuffer_tools(), reason="flatbuffer_direct requires bundled schema artifacts")
+def test_flatbuffer_direct_in_memory_rejects_enable_auto_split_model() -> None:
+    """Test that in_memory=True rejects enable_auto_split_model=True."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model = _make_add_chain_model()
+        model_path = _save_model(tmpdir, "add_chain_in_memory_split", model)
+        out_dir = os.path.join(tmpdir, "out")
+        with pytest.raises(ValueError):
+            onnx2tf.convert(
+                input_onnx_file_path=model_path,
+                output_folder_path=out_dir,
+                disable_strict_mode=True,
+                verbosity="error",
+                tflite_backend="flatbuffer_direct",
+                in_memory=True,
+                enable_auto_split_model=True,
+            )
+
+
+@pytest.mark.skipif(not _requires_flatbuffer_tools(), reason="flatbuffer_direct requires bundled schema artifacts")
+def test_flatbuffer_direct_in_memory_rejects_eval_with_onnx() -> None:
+    """Test that in_memory=True rejects eval_with_onnx=True."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model = _make_add_chain_model()
+        model_path = _save_model(tmpdir, "add_chain_in_memory_eval", model)
+        out_dir = os.path.join(tmpdir, "out")
+        with pytest.raises(ValueError):
+            onnx2tf.convert(
+                input_onnx_file_path=model_path,
+                output_folder_path=out_dir,
+                disable_strict_mode=True,
+                verbosity="error",
+                tflite_backend="flatbuffer_direct",
+                in_memory=True,
+                eval_with_onnx=True,
+            )
+
+
+@pytest.mark.skipif(not _requires_flatbuffer_tools(), reason="flatbuffer_direct requires bundled schema artifacts")
+def test_flatbuffer_direct_in_memory_rejects_tf_converter_backend() -> None:
+    """Test that in_memory=True requires flatbuffer_direct backend."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model = _make_add_chain_model()
+        model_path = _save_model(tmpdir, "add_chain_in_memory_tf_backend", model)
+        out_dir = os.path.join(tmpdir, "out")
+        with pytest.raises(ValueError):
+            onnx2tf.convert(
+                input_onnx_file_path=model_path,
+                output_folder_path=out_dir,
+                disable_strict_mode=True,
+                verbosity="error",
+                tflite_backend="tf_converter",
+                in_memory=True,
+            )
+
+
+@pytest.mark.skipif(not _requires_flatbuffer_tools(), reason="flatbuffer_direct requires bundled schema artifacts")
+def test_flatbuffer_direct_in_memory_compatible_with_saved_model_export() -> None:
+    """Test that in_memory=True works with saved_model export (regression test)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model = _make_add_chain_model()
+        model_path = _save_model(tmpdir, "add_chain_in_memory_saved_model", model)
+        out_dir = os.path.join(tmpdir, "out")
+        result = onnx2tf.convert(
+            input_onnx_file_path=model_path,
+            output_folder_path=out_dir,
+            disable_strict_mode=True,
+            verbosity="error",
+            tflite_backend="flatbuffer_direct",
+            in_memory=True,
+            flatbuffer_direct_output_saved_model=True,
+        )
+        assert isinstance(result, dict)
+        assert "float32" in result
+        # Verify SavedModel was exported
+        saved_model_files = glob.glob(os.path.join(out_dir, "**", "saved_model.pb"), recursive=True)
+        assert len(saved_model_files) > 0, "SavedModel.pb not found in output directory"

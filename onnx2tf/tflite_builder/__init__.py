@@ -22,6 +22,7 @@ from onnx2tf.tflite_builder.lower_from_onnx2tf import (
 from onnx2tf.tflite_builder.model_writer import (
     MODEL_METADATA_ENTRIES_KEY,
     write_model_file,
+    write_or_serialize_model_file,
 )
 from onnx2tf.tflite_builder.quantization import (
     build_dynamic_range_quantized_model_ir,
@@ -155,6 +156,8 @@ def _build_export_progress_labels(
     output_weights: bool,
     output_saved_model_from_model_ir: bool,
     output_pytorch_from_model_ir: bool,
+    skip_float32_tflite: bool = False,
+    skip_float16_tflite: bool = False,
 ) -> List[str]:
     labels: List[str] = [
         "tensor correspondence report",
@@ -171,10 +174,14 @@ def _build_export_progress_labels(
             "write float16 tflite",
         ]
     )
+    if skip_float32_tflite:
+        labels.remove("write float32 tflite")
     if not output_saved_model_from_model_ir:
         labels.remove("write saved_model")
     if not output_pytorch_from_model_ir:
         labels.remove("write pytorch")
+    if skip_float16_tflite:
+        labels.remove("write float16 tflite")
     if output_dynamic_range_quantized_tflite:
         labels.append("write dynamic range quant tflite")
     if output_integer_quantized_tflite:
@@ -312,6 +319,9 @@ def export_tflite_model_flatbuffer_direct(**kwargs: Any) -> Dict[str, Any]:
     output_exported_program_from_model_ir = bool(
         kwargs.get("output_exported_program_from_model_ir", False)
     )
+    skip_float32_tflite = bool(kwargs.get("skip_float32_tflite", False))
+    skip_float16_tflite = bool(kwargs.get("skip_float16_tflite", False))
+    in_memory = bool(kwargs.get("in_memory", False))
     if (
         output_torchscript_from_model_ir
         or output_dynamo_onnx_from_model_ir
@@ -463,6 +473,8 @@ def export_tflite_model_flatbuffer_direct(**kwargs: Any) -> Dict[str, Any]:
         kwargs.get("fused_argmax_scale_ratio", 0.5)
     )
     requested_pseudo_ops_raw = kwargs.get("replace_to_pseudo_operators", None)
+    keep_inputs_nhwc = bool(kwargs.get("keep_inputs_nhwc", False))
+    keep_outputs_nhwc = bool(kwargs.get("keep_outputs_nhwc", False))
     input_names_to_interrupt_model_conversion = kwargs.get(
         "input_names_to_interrupt_model_conversion",
         None,
@@ -596,6 +608,8 @@ def export_tflite_model_flatbuffer_direct(**kwargs: Any) -> Dict[str, Any]:
             replace_argmax_to_fused_argmax_and_indices_is_float32=replace_argmax_to_fused_argmax_and_indices_is_float32,
             fused_argmax_scale_ratio=fused_argmax_scale_ratio,
             replace_to_pseudo_operators=requested_pseudo_ops,
+            keep_inputs_nhwc=keep_inputs_nhwc,
+            keep_outputs_nhwc=keep_outputs_nhwc,
             protected_boundary_tensor_names=list(
                 dict.fromkeys(
                     list(input_names_to_interrupt_model_conversion or [])
@@ -651,6 +665,8 @@ def export_tflite_model_flatbuffer_direct(**kwargs: Any) -> Dict[str, Any]:
         output_weights=output_weights,
         output_saved_model_from_model_ir=output_saved_model_from_model_ir,
         output_pytorch_from_model_ir=output_pytorch_from_model_ir,
+        skip_float32_tflite=skip_float32_tflite,
+        skip_float16_tflite=skip_float16_tflite,
     )
     export_progress_total = int(len(export_progress_labels))
     export_progress_step = 0
@@ -775,6 +791,13 @@ def export_tflite_model_flatbuffer_direct(**kwargs: Any) -> Dict[str, Any]:
                 ),
             )
             if split_required_by_estimate or force_split_manifest:
+                if in_memory and (split_required_by_estimate or force_split_manifest):
+                    raise RuntimeError(
+                        'in_memory=True is incompatible with tflite splitting. '
+                        'This model requires splitting into multiple tflite partitions on disk '
+                        '(split_required_by_estimate or force_split_manifest is True). '
+                        'Increase tflite_split_max_bytes/tflite_split_target_bytes, or set in_memory=False.'
+                    )
                 from ai_edge_litert.interpreter import Interpreter
 
                 def _validate_split_tflite_loadable(tflite_path: str) -> None:
@@ -808,27 +831,31 @@ def export_tflite_model_flatbuffer_direct(**kwargs: Any) -> Dict[str, Any]:
             model_ir=model_ir_fp32,
             enable_accumulation_type_float16=enable_accumulation_type_float16,
         )
-        float32_path = os.path.join(output_folder_path, f"{output_file_name}_float32.tflite")
+        float32_path = None
+        float32_bytes = None
         saved_model_path = None
-        float32_write_timing: Dict[str, Any] = {}
-        model_ir_fp32_tflite = clone_model_ir_with_float32(model_ir_fp32)
-        _optimize_constant_input_scatter_nd_chains(model_ir_fp32_tflite)
-        _optimize_constant_binary_elementwise_chains(model_ir_fp32_tflite)
-        write_model_file(
-            schema_tflite=schema_tflite,
-            model_ir=model_ir_fp32_tflite,
-            output_tflite_path=float32_path,
-            timing=float32_write_timing,
-        )
-        write_timing_report["float32"] = float32_write_timing
-        _progress_write(
-            message=_format_write_timing_line(
-                stage="float32",
+        if not skip_float32_tflite:
+            float32_path = os.path.join(output_folder_path, f"{output_file_name}_float32.tflite")
+            float32_write_timing: Dict[str, Any] = {}
+            model_ir_fp32_tflite = clone_model_ir_with_float32(model_ir_fp32)
+            _optimize_constant_input_scatter_nd_chains(model_ir_fp32_tflite)
+            _optimize_constant_binary_elementwise_chains(model_ir_fp32_tflite)
+            float32_path, float32_bytes = write_or_serialize_model_file(
+                schema_tflite=schema_tflite,
+                model_ir=model_ir_fp32_tflite,
+                output_tflite_path=float32_path,
                 timing=float32_write_timing,
-            ),
-            enabled=bool(flatbuffer_direct_show_progress),
-        )
-        _advance_export_progress()
+                in_memory=in_memory,
+            )
+            write_timing_report["float32"] = float32_write_timing
+            _progress_write(
+                message=_format_write_timing_line(
+                    stage="float32",
+                    timing=float32_write_timing,
+                ),
+                enabled=bool(flatbuffer_direct_show_progress),
+            )
+            _advance_export_progress()
 
         if output_saved_model_from_model_ir:
             require_tensorflow("flatbuffer_direct SavedModel export")
@@ -969,38 +996,43 @@ def export_tflite_model_flatbuffer_direct(**kwargs: Any) -> Dict[str, Any]:
                     )
             _advance_export_progress()
 
-        _set_export_progress_desc("write float16 tflite")
-        model_ir_fp16 = clone_model_ir_with_float16(model_ir)
-        optimize_redundant_transpose_operators(
-            model_ir_fp16,
-            preserve_model_outputs=True,
-        )
-        _set_reduced_precision_support_metadata(
-            model_ir=model_ir_fp16,
-            enable_accumulation_type_float16=enable_accumulation_type_float16,
-        )
-        float16_path = os.path.join(output_folder_path, f"{output_file_name}_float16.tflite")
-        float16_write_timing: Dict[str, Any] = {}
-        model_ir_fp16_tflite = clone_model_ir_with_float16(model_ir_fp16)
-        _optimize_constant_input_scatter_nd_chains(model_ir_fp16_tflite)
-        _optimize_constant_binary_elementwise_chains(model_ir_fp16_tflite)
-        write_model_file(
-            schema_tflite=schema_tflite,
-            model_ir=model_ir_fp16_tflite,
-            output_tflite_path=float16_path,
-            timing=float16_write_timing,
-        )
-        write_timing_report["float16"] = float16_write_timing
-        _progress_write(
-            message=_format_write_timing_line(
-                stage="float16",
+        float16_path = None
+        float16_bytes = None
+        if not skip_float16_tflite:
+            _set_export_progress_desc("write float16 tflite")
+            model_ir_fp16 = clone_model_ir_with_float16(model_ir)
+            optimize_redundant_transpose_operators(
+                model_ir_fp16,
+                preserve_model_outputs=True,
+            )
+            _set_reduced_precision_support_metadata(
+                model_ir=model_ir_fp16,
+                enable_accumulation_type_float16=enable_accumulation_type_float16,
+            )
+            float16_path = os.path.join(output_folder_path, f"{output_file_name}_float16.tflite")
+            float16_write_timing: Dict[str, Any] = {}
+            model_ir_fp16_tflite = clone_model_ir_with_float16(model_ir_fp16)
+            _optimize_constant_input_scatter_nd_chains(model_ir_fp16_tflite)
+            _optimize_constant_binary_elementwise_chains(model_ir_fp16_tflite)
+            float16_path, float16_bytes = write_or_serialize_model_file(
+                schema_tflite=schema_tflite,
+                model_ir=model_ir_fp16_tflite,
+                output_tflite_path=float16_path,
                 timing=float16_write_timing,
-            ),
-            enabled=bool(flatbuffer_direct_show_progress),
-        )
-        _advance_export_progress()
+                in_memory=in_memory,
+            )
+            write_timing_report["float16"] = float16_write_timing
+            _progress_write(
+                message=_format_write_timing_line(
+                    stage="float16",
+                    timing=float16_write_timing,
+                ),
+                enabled=bool(flatbuffer_direct_show_progress),
+            )
+            _advance_export_progress()
 
         dynamic_range_path = None
+        dynamic_range_bytes = None
         if output_dynamic_range_quantized_tflite:
             _set_export_progress_desc("write dynamic range quant tflite")
             dynamic_model_ir = build_dynamic_range_quantized_model_ir(
@@ -1017,11 +1049,12 @@ def export_tflite_model_flatbuffer_direct(**kwargs: Any) -> Dict[str, Any]:
                 f"{output_file_name}_dynamic_range_quant.tflite",
             )
             dynamic_range_write_timing: Dict[str, Any] = {}
-            write_model_file(
+            dynamic_range_path, dynamic_range_bytes = write_or_serialize_model_file(
                 schema_tflite=schema_tflite,
                 model_ir=dynamic_model_ir,
                 output_tflite_path=dynamic_range_path,
                 timing=dynamic_range_write_timing,
+                in_memory=in_memory,
             )
             write_timing_report["dynamic_range_quant"] = dynamic_range_write_timing
             _progress_write(
@@ -1034,7 +1067,13 @@ def export_tflite_model_flatbuffer_direct(**kwargs: Any) -> Dict[str, Any]:
             _advance_export_progress()
 
         integer_quant_path = None
+        integer_quant_bytes = None
         full_integer_quant_path = None
+        full_integer_quant_bytes = None
+        integer_quant_with_int16_act_path = None
+        integer_quant_with_int16_act_bytes = None
+        full_integer_quant_with_int16_act_path = None
+        full_integer_quant_with_int16_act_bytes = None
         if output_integer_quantized_tflite:
             _set_export_progress_desc("write integer quant tflite")
             integer_model_ir = build_integer_quantized_model_ir(
@@ -1051,11 +1090,12 @@ def export_tflite_model_flatbuffer_direct(**kwargs: Any) -> Dict[str, Any]:
                 f"{output_file_name}_integer_quant.tflite",
             )
             integer_quant_write_timing: Dict[str, Any] = {}
-            write_model_file(
+            integer_quant_path, integer_quant_bytes = write_or_serialize_model_file(
                 schema_tflite=schema_tflite,
                 model_ir=integer_model_ir,
                 output_tflite_path=integer_quant_path,
                 timing=integer_quant_write_timing,
+                in_memory=in_memory,
             )
             write_timing_report["integer_quant"] = integer_quant_write_timing
             _progress_write(
@@ -1084,11 +1124,12 @@ def export_tflite_model_flatbuffer_direct(**kwargs: Any) -> Dict[str, Any]:
                 f"{output_file_name}_full_integer_quant.tflite",
             )
             full_integer_quant_write_timing: Dict[str, Any] = {}
-            write_model_file(
+            full_integer_quant_path, full_integer_quant_bytes = write_or_serialize_model_file(
                 schema_tflite=schema_tflite,
                 model_ir=full_integer_model_ir,
                 output_tflite_path=full_integer_quant_path,
                 timing=full_integer_quant_write_timing,
+                in_memory=in_memory,
             )
             write_timing_report["full_integer_quant"] = full_integer_quant_write_timing
             _progress_write(
@@ -1115,11 +1156,12 @@ def export_tflite_model_flatbuffer_direct(**kwargs: Any) -> Dict[str, Any]:
                 f"{output_file_name}_integer_quant_with_int16_act.tflite",
             )
             integer_quant_int16_write_timing: Dict[str, Any] = {}
-            write_model_file(
+            integer_quant_with_int16_act_path, integer_quant_with_int16_act_bytes = write_or_serialize_model_file(
                 schema_tflite=schema_tflite,
                 model_ir=integer_quant_with_int16_act_model_ir,
                 output_tflite_path=integer_quant_with_int16_act_path,
                 timing=integer_quant_int16_write_timing,
+                in_memory=in_memory,
             )
             write_timing_report["integer_quant_with_int16_act"] = integer_quant_int16_write_timing
             _progress_write(
@@ -1146,11 +1188,12 @@ def export_tflite_model_flatbuffer_direct(**kwargs: Any) -> Dict[str, Any]:
                 f"{output_file_name}_full_integer_quant_with_int16_act.tflite",
             )
             full_integer_quant_int16_write_timing: Dict[str, Any] = {}
-            write_model_file(
+            full_integer_quant_with_int16_act_path, full_integer_quant_with_int16_act_bytes = write_or_serialize_model_file(
                 schema_tflite=schema_tflite,
                 model_ir=full_integer_quant_with_int16_act_model_ir,
                 output_tflite_path=full_integer_quant_with_int16_act_path,
                 timing=full_integer_quant_int16_write_timing,
+                in_memory=in_memory,
             )
             write_timing_report["full_integer_quant_with_int16_act"] = full_integer_quant_int16_write_timing
             _progress_write(
@@ -1163,28 +1206,32 @@ def export_tflite_model_flatbuffer_direct(**kwargs: Any) -> Dict[str, Any]:
             _advance_export_progress()
         else:
             integer_quant_with_int16_act_path = None
+            integer_quant_with_int16_act_bytes = None
             full_integer_quant_with_int16_act_path = None
+            full_integer_quant_with_int16_act_bytes = None
 
         if output_weights:
-            _set_export_progress_desc("export float32 weights")
-            weights_export(
-                extract_target_tflite_file_path=float32_path,
-                output_weights_file_path=os.path.join(
-                    output_folder_path,
-                    f"{output_file_name}_float32_weights.h5",
-                ),
-            )
-            _advance_export_progress()
+            if float32_path is not None:
+                _set_export_progress_desc("export float32 weights")
+                weights_export(
+                    extract_target_tflite_file_path=float32_path,
+                    output_weights_file_path=os.path.join(
+                        output_folder_path,
+                        f"{output_file_name}_float32_weights.h5",
+                    ),
+                )
+                _advance_export_progress()
 
-            _set_export_progress_desc("export float16 weights")
-            weights_export(
-                extract_target_tflite_file_path=float16_path,
-                output_weights_file_path=os.path.join(
-                    output_folder_path,
-                    f"{output_file_name}_float16_weights.h5",
-                ),
-            )
-            _advance_export_progress()
+            if float16_path is not None:
+                _set_export_progress_desc("export float16 weights")
+                weights_export(
+                    extract_target_tflite_file_path=float16_path,
+                    output_weights_file_path=os.path.join(
+                        output_folder_path,
+                        f"{output_file_name}_float16_weights.h5",
+                    ),
+                )
+                _advance_export_progress()
 
             if dynamic_range_path is not None:
                 _set_export_progress_desc("export dynamic range quant weights")
@@ -1249,6 +1296,10 @@ def export_tflite_model_flatbuffer_direct(**kwargs: Any) -> Dict[str, Any]:
         "float32_tflite_path": float32_path,
         "float16_tflite_path": float16_path,
     }
+    if float32_bytes is not None:
+        outputs["float32_tflite_bytes"] = float32_bytes
+    if float16_bytes is not None:
+        outputs["float16_tflite_bytes"] = float16_bytes
     if saved_model_path is not None:
         outputs["saved_model_path"] = str(saved_model_path)
         outputs["saved_model_persisted"] = bool(persist_saved_model_output)
@@ -1264,14 +1315,24 @@ def export_tflite_model_flatbuffer_direct(**kwargs: Any) -> Dict[str, Any]:
         outputs["write_timing_report"] = write_timing_report
     if dynamic_range_path is not None:
         outputs["dynamic_range_quant_tflite_path"] = dynamic_range_path
+    if dynamic_range_bytes is not None:
+        outputs["dynamic_range_quant_tflite_bytes"] = dynamic_range_bytes
     if integer_quant_path is not None:
         outputs["integer_quant_tflite_path"] = integer_quant_path
+    if integer_quant_bytes is not None:
+        outputs["integer_quant_tflite_bytes"] = integer_quant_bytes
     if full_integer_quant_path is not None:
         outputs["full_integer_quant_tflite_path"] = full_integer_quant_path
+    if full_integer_quant_bytes is not None:
+        outputs["full_integer_quant_tflite_bytes"] = full_integer_quant_bytes
     if integer_quant_with_int16_act_path is not None:
         outputs["integer_quant_with_int16_act_tflite_path"] = integer_quant_with_int16_act_path
+    if integer_quant_with_int16_act_bytes is not None:
+        outputs["integer_quant_with_int16_act_tflite_bytes"] = integer_quant_with_int16_act_bytes
     if full_integer_quant_with_int16_act_path is not None:
         outputs["full_integer_quant_with_int16_act_tflite_path"] = full_integer_quant_with_int16_act_path
+    if full_integer_quant_with_int16_act_bytes is not None:
+        outputs["full_integer_quant_with_int16_act_tflite_bytes"] = full_integer_quant_with_int16_act_bytes
     if split_plan_report_path is not None:
         outputs["split_plan_report_path"] = split_plan_report_path
         outputs["split_required_by_estimate"] = bool(split_required_by_estimate)

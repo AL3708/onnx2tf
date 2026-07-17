@@ -583,7 +583,57 @@ def make_node(
                 h_w_scale = cast(Any, scales)[1:input_tensor_rank-1]
                 h_w_shape = input_tensor_shape[1:input_tensor_rank-1]
                 scales_dtype = cast(Any, scales).dtype
+                if None not in h_w_shape:
+                    try:
+                        new_size = tf.constant(
+                            [max(1, int(round(float(s) * int(h)))) for s, h in zip(h_w_scale, h_w_shape)],
+                            dtype=tf.int32,
+                        )
+                    except (TypeError, ValueError):
+                        new_size = tf.cast(
+                            h_w_scale * tf.cast(
+                                h_w_shape,
+                                NUMPY_DTYPES_TO_TF_DTYPES[scales_dtype] \
+                                    if isinstance(scales_dtype, np.dtype) else scales_dtype,
+                            ),
+                            tf.int32,
+                        )
+                else:
+                    try:
+                        new_size = tf.cast(
+                            h_w_scale * tf.cast(
+                                h_w_shape,
+                                NUMPY_DTYPES_TO_TF_DTYPES[scales_dtype] \
+                                    if isinstance(scales_dtype, np.dtype) else scales_dtype,
+                            ),
+                            tf.int32,
+                        )
+                    except:
+                        # Workaround when h_w_shape contains undefined dimensions
+                        new_size = tf.cast(
+                            h_w_scale * tf.cast(
+                                tf.slice(
+                                    tf.shape(input_tensor),
+                                    begin=[1],
+                                    size=[input_tensor_rank - 2],
+                                ),
+                                NUMPY_DTYPES_TO_TF_DTYPES[scales_dtype] \
+                                    if isinstance(scales_dtype, np.dtype) else scales_dtype,
+                            ),
+                            tf.int32,
+                        )
+        else:
+            h_w_scale = cast(Any, scales)[1:input_tensor_rank-1]
+            h_w_shape = input_tensor_shape[1:input_tensor_rank-1]
+            scales_dtype = cast(Any, scales).dtype
+            if None not in h_w_shape:
+                # Static scales + static input shape: tf.constant avoids TFLite MUL op.
                 try:
+                    new_size = tf.constant(
+                        [max(1, int(round(float(s) * int(h)))) for s, h in zip(h_w_scale, h_w_shape)],
+                        dtype=tf.int32,
+                    )
+                except (TypeError, ValueError):
                     new_size = tf.cast(
                         h_w_scale * tf.cast(
                             h_w_shape,
@@ -592,33 +642,6 @@ def make_node(
                         ),
                         tf.int32,
                     )
-                except:
-                    # Workaround when h_w_shape contains undefined dimensions
-                    new_size = tf.cast(
-                        h_w_scale * tf.cast(
-                            tf.slice(
-                                tf.shape(input_tensor),
-                                begin=[1],
-                                size=[input_tensor_rank - 2],
-                            ),
-                            NUMPY_DTYPES_TO_TF_DTYPES[scales_dtype] \
-                                if isinstance(scales_dtype, np.dtype) else scales_dtype,
-                        ),
-                        tf.int32,
-                    )
-        else:
-            h_w_scale = cast(Any, scales)[1:input_tensor_rank-1]
-            h_w_shape = input_tensor_shape[1:input_tensor_rank-1]
-            scales_dtype = cast(Any, scales).dtype
-            if None not in h_w_shape:
-                new_size = tf.cast(
-                    h_w_scale * tf.cast(
-                        h_w_shape,
-                        NUMPY_DTYPES_TO_TF_DTYPES[scales_dtype] \
-                            if isinstance(scales_dtype, np.dtype) else scales_dtype,
-                    ),
-                    tf.int32,
-                )
             else:
                 h_w_shape = tf.slice(
                     tf.shape(input_tensor),
