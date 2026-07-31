@@ -890,7 +890,7 @@ def build_slice_op(node: Any, ctx: Any) -> None:
         else:
             end_vec = [int32_max for _ in range(rank)]
             for idx, axis in enumerate(normalized_axes):
-                end_vec[int(axis)] = int(ends[idx])
+                end_vec[int(axis)] = min(int(ends[idx]), int32_max)
             end_name = ctx.add_const_tensor(
                 f"{output_name}_stridedslice_end",
                 np.asarray(end_vec, dtype=np.int32),
